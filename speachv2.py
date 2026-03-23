@@ -45,7 +45,7 @@ CACHE_FILE = "asl_signs_cache.npz"
 WINDOW_WIDTH = 1000
 WINDOW_HEIGHT = 700
 FPS = 30
-ANIMATION_SPEED = 1.0
+ANIMATION_SPEED = 0.5  # Slower animation (was 1.0)
 
 # Avatar colors
 SKIN_COLOR = (180, 160, 150)
@@ -64,6 +64,23 @@ class SignDatabase:
         self.signs = {}
         self.classes = []
         self.load_data(cache_file)
+    
+    def interpolate_frames(self, frames, factor=2):
+        """Interpolate between frames for smoother animation."""
+        if len(frames) < 2:
+            return frames
+        
+        interpolated = []
+        for i in range(len(frames) - 1):
+            interpolated.append(frames[i])
+            # Add interpolated frames between each pair
+            for j in range(1, factor):
+                t = j / factor
+                interp = frames[i] * (1 - t) + frames[i + 1] * t
+                interpolated.append(interp)
+        interpolated.append(frames[-1])
+        
+        return np.array(interpolated)
     
     def load_data(self, cache_file):
         if not os.path.exists(cache_file):
@@ -89,11 +106,14 @@ class SignDatabase:
                         valid_frames.append(seq[f])
                 
                 if valid_frames:
-                    self.signs[label] = np.array(valid_frames)
+                    # Interpolate for smoother animation
+                    frames = np.array(valid_frames)
+                    frames = self.interpolate_frames(frames, factor=3)
+                    self.signs[label] = frames
                 else:
                     self.signs[label] = seq[:10]  # Fallback
         
-        print(f"Loaded {len(self.signs)} signs")
+        print(f"Loaded {len(self.signs)} signs (with interpolation)")
     
     def _create_demo(self):
         for word in ['hello', 'thank', 'you']:
@@ -129,9 +149,9 @@ class AvatarRenderer:
         self.center_y = height // 2 + 50
         self.scale = 350
         
-        # Smoothing
+        # Smoothing - higher = more responsive, lower = smoother
         self.prev_landmarks = None
-        self.smooth = 0.4
+        self.smooth = 0.25  # More fluid (was 0.4)
         
         # Hand connections for drawing fingers
         self.finger_chains = [
