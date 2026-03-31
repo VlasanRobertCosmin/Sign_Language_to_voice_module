@@ -1,9 +1,12 @@
 """
 Sign Language Translator Application (OpenCV UI)
 =================================================
-A complete application with two modules:
-1. Sign to Voice - Recognizes ASL signs and speaks them
-2. Voice to Sign - Converts speech to animated sign language
+Modules:
+  1. Sign -> Voice  — camera + MediaPipe -> ASL model -> speech
+  2. Voice -> Sign  — mic / text input   -> avatar animation
+
+Model support: V1 (LSTM), V2 (Hybrid), V3 (Large Hybrid) — auto-detected.
+TTS fallback:  pyttsx3 -> gTTS -> espeak -> print.
 
 Requirements:
     pip install numpy opencv-python torch mediapipe Pillow
@@ -11,7 +14,6 @@ Requirements:
 """
 
 import os
-import sys
 import threading
 import time
 import numpy as np
@@ -20,246 +22,149 @@ from collections import deque
 import math
 import pickle
 
-# Suppress ALSA warnings on Linux
+# -- Suppress ALSA noise on Linux --------------------------------------------
 try:
     from ctypes import *
-    ERROR_HANDLER_FUNC = CFUNCTYPE(None, c_char_p, c_int, c_char_p, c_int, c_char_p)
-    def py_error_handler(filename, line, function, err, fmt):
+    _EHF = CFUNCTYPE(None, c_char_p, c_int, c_char_p, c_int, c_char_p)
+    def _noop(*a): pass
+    try:
+        cdll.LoadLibrary('libasound.so.2').snd_lib_error_set_handler(_EHF(_noop))
+    except Exception:
         pass
-    c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
-    asound = cdll.LoadLibrary('libasound.so.2')
-    asound.snd_lib_error_set_handler(c_error_handler)
-except:
+except Exception:
     pass
 
-# Optional imports
+# -- Optional deps -----------------------------------------------------------
 try:
     import torch
     import torch.nn as nn
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
-    print("PyTorch not available - Sign to Voice disabled")
+    print("PyTorch not available -- Sign->Voice disabled")
 
 try:
     import speech_recognition as sr
     SPEECH_AVAILABLE = True
-except:
+except ImportError:
     SPEECH_AVAILABLE = False
-    print("SpeechRecognition not available - Voice input disabled")
-
-try:
-    import pyttsx3
-    TTS_AVAILABLE = True
-except:
-    TTS_AVAILABLE = False
-    print("pyttsx3 not available - Voice output disabled")
+    print("SpeechRecognition not available -- mic input disabled")
 
 try:
     import mediapipe as mp
     MEDIAPIPE_AVAILABLE = True
-except:
+except ImportError:
     MEDIAPIPE_AVAILABLE = False
-    print("MediaPipe not available - Sign to Voice disabled")
+    print("MediaPipe not available -- Sign->Voice disabled")
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION  (edit paths here)
 # ============================================================
 
-MODEL_PATH = "asl_signs_model_v3.pth"
+MODEL_PATH   = "asl_signs_model_v3.pth"
 ENCODER_PATH = "asl_signs_encoder_v3.pkl"
-CACHE_FILE = "asl_signs_cache.npz"
+CACHE_FILE   = "asl_signs_cache.npz"
 
-# UI dimensions
-WIN_W = 1280
-WIN_H = 720
+# UI layout
+WIN_W   = 1280
+WIN_H   = 720
 VIDEO_W = 820
-PANEL_W = WIN_W - VIDEO_W  # 460
+PANEL_W = WIN_W - VIDEO_W   # 460
 
-# Colors (BGR for OpenCV)
-BG_COLOR       = (43, 43, 43)
-PANEL_COLOR    = (54, 54, 54)
-ACCENT_COLOR   = (255, 158, 74)   # orange-ish
-SUCCESS_COLOR  = (127, 255, 74)   # green
-ERROR_COLOR    = (107, 107, 255)  # red-ish
-TEXT_COLOR     = (240, 240, 240)
-DIM_COLOR      = (140, 140, 140)
-DARK_COLOR     = (30, 30, 30)
-HIGHLIGHT      = (255, 200, 80)
-
-
-# ============================================================
-# DRAWING HELPERS
-# ============================================================
-
-def draw_rect(img, x, y, w, h, color, radius=8, alpha=1.0):
-    """Filled rounded rectangle."""
-    overlay = img.copy()
-    cv2.rectangle(overlay, (x + radius, y), (x + w - radius, y + h), color, -1)
-    cv2.rectangle(overlay, (x, y + radius), (x + w, y + h - radius), color, -1)
-    for cx, cy in [(x+radius, y+radius), (x+w-radius, y+radius),
-                   (x+radius, y+h-radius), (x+w-radius, y+h-radius)]:
-        cv2.circle(overlay, (cx, cy), radius, color, -1)
-    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
-
-
-def draw_text(img, text, x, y, scale=0.6, color=TEXT_COLOR, thickness=1, center=False, font=cv2.FONT_HERSHEY_SIMPLEX):
-    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
-    tx = x - tw // 2 if center else x
-    cv2.putText(img, text, (tx, y), font, scale, color, thickness, cv2.LINE_AA)
-    return tw, th
-
-
-def draw_button(img, label, x, y, w, h, color, text_color=DARK_COLOR, active=False):
-    border_color = HIGHLIGHT if active else color
-    draw_rect(img, x, y, w, h, color)
-    if active:
-        cv2.rectangle(img, (x, y), (x+w, y+h), border_color, 2)
-    draw_text(img, label, x + w//2, y + h//2 + 6, scale=0.55, color=text_color,
-              thickness=1, center=True)
-    return (x, y, w, h)  # hit area
-
-
-def draw_badge(img, text, x, y, color):
-    (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-    pad = 6
-    draw_rect(img, x, y - 14, tw + pad*2, 20, color, radius=5)
-    draw_text(img, text, x + pad, y, scale=0.45, color=DARK_COLOR)
+# Palette (BGR)
+BG_COLOR      = (43,  43,  43)
+PANEL_COLOR   = (54,  54,  54)
+ACCENT_COLOR  = (255, 158,  74)
+SUCCESS_COLOR = (127, 255,  74)
+ERROR_COLOR   = (107, 107, 255)
+TEXT_COLOR    = (240, 240, 240)
+DIM_COLOR     = (140, 140, 140)
+DARK_COLOR    = (30,  30,  30)
+HIGHLIGHT     = (255, 200,  80)
+REC_COLOR     = (60,  60,  220)
 
 
 # ============================================================
-# MODEL DEFINITION
-# ============================================================
-
-if TORCH_AVAILABLE:
-    class PositionalEncoding(nn.Module):
-        def __init__(self, d_model, max_len=100, dropout=0.1):
-            super().__init__()
-            self.dropout = nn.Dropout(p=dropout)
-            pe = torch.zeros(max_len, d_model)
-            position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-            div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-            pe[:, 0::2] = torch.sin(position * div_term)
-            pe[:, 1::2] = torch.cos(position * div_term)
-            self.register_buffer('pe', pe.unsqueeze(0))
-
-        def forward(self, x):
-            x = x + self.pe[:, :x.size(1)]
-            return self.dropout(x)
-
-    class ConvSubsampling(nn.Module):
-        def __init__(self, d_model, dropout=0.1):
-            super().__init__()
-            self.conv = nn.Sequential(
-                nn.Conv1d(d_model, d_model, kernel_size=3, padding=1), nn.GELU(), nn.Dropout(dropout),
-                nn.Conv1d(d_model, d_model, kernel_size=3, padding=1), nn.GELU(), nn.Dropout(dropout),
-            )
-            self.norm = nn.LayerNorm(d_model)
-
-        def forward(self, x):
-            residual = x
-            x = x.transpose(1, 2)
-            x = self.conv(x)
-            x = x.transpose(1, 2)
-            return self.norm(x + residual)
-
-    class ASLModelV3(nn.Module):
-        def __init__(self, input_size, num_classes, d_model=384, n_heads=8,
-                     n_layers=6, dim_ff=1536, dropout=0.4, max_frames=64):
-            super().__init__()
-            self.d_model = d_model
-            self.input_norm = nn.LayerNorm(input_size)
-            self.input_proj1 = nn.Linear(input_size, d_model)
-            self.input_proj2 = nn.Sequential(nn.GELU(), nn.Dropout(dropout * 0.5), nn.Linear(d_model, d_model))
-            self.input_ln = nn.LayerNorm(d_model)
-            self.conv_subsample = ConvSubsampling(d_model, dropout * 0.5)
-            self.pos_encoder = PositionalEncoding(d_model, max_len=max_frames, dropout=dropout * 0.5)
-            encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=dim_ff,
-                dropout=dropout, activation='gelu', batch_first=True, norm_first=True)
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-            self.trans_ln = nn.LayerNorm(d_model)
-            self.lstm = nn.LSTM(d_model, d_model // 2, num_layers=2, batch_first=True, dropout=dropout, bidirectional=True)
-            self.lstm_ln = nn.LayerNorm(d_model)
-            self.n_queries = 4
-            self.pool_queries = nn.Parameter(torch.randn(1, self.n_queries, d_model * 2))
-            self.pool_attention = nn.MultiheadAttention(embed_dim=d_model * 2, num_heads=n_heads, dropout=dropout, batch_first=True)
-            self.pool_ln = nn.LayerNorm(d_model * 2)
-            self.classifier = nn.Sequential(
-                nn.Linear(d_model * 2 * self.n_queries, 768), nn.LayerNorm(768), nn.GELU(), nn.Dropout(dropout),
-                nn.Linear(768, 384), nn.LayerNorm(384), nn.GELU(), nn.Dropout(dropout * 0.7),
-                nn.Linear(384, num_classes))
-
-        def forward(self, x):
-            batch_size = x.size(0)
-            x = self.input_norm(x)
-            x = self.input_proj1(x)
-            x = self.input_proj2(x) + x
-            x = self.input_ln(x)
-            x = self.conv_subsample(x)
-            x_pos = self.pos_encoder(x)
-            x_trans = self.transformer(x_pos)
-            x_trans = self.trans_ln(x_trans)
-            x_lstm, _ = self.lstm(x)
-            x_lstm = self.lstm_ln(x_lstm)
-            combined = torch.cat([x_trans, x_lstm], dim=-1)
-            queries = self.pool_queries.expand(batch_size, -1, -1)
-            pooled, _ = self.pool_attention(queries, combined, combined)
-            pooled = self.pool_ln(pooled)
-            pooled = pooled.view(batch_size, -1)
-            return self.classifier(pooled)
-
-
-# ============================================================
-# TEXT TO SPEECH
+# TEXT-TO-SPEECH  (pyttsx3 -> gTTS -> espeak -> print)
 # ============================================================
 
 class TextToSpeech:
     def __init__(self):
-        self.engine = None
-        if TTS_AVAILABLE:
-            try:
-                self.engine = pyttsx3.init()
-                self.engine.setProperty('rate', 150)
-                self.engine.setProperty('volume', 0.9)
-            except:
-                self.engine = None
+        self._kind   = None
+        self._engine = None
+        self._init()
+
+    def _init(self):
+        try:
+            import pyttsx3
+            e = pyttsx3.init()
+            e.setProperty('rate', 150)
+            e.setProperty('volume', 0.9)
+            self._kind, self._engine = 'pyttsx3', e
+            print("TTS: pyttsx3 (offline)"); return
+        except Exception:
+            pass
+        try:
+            from gtts import gTTS
+            import pygame
+            pygame.mixer.init()
+            self._kind = 'gtts'
+            print("TTS: gTTS (online)"); return
+        except Exception:
+            pass
+        try:
+            import subprocess
+            if subprocess.run(['espeak','--version'], capture_output=True).returncode == 0:
+                self._kind = 'espeak'
+                print("TTS: espeak (Linux)"); return
+        except Exception:
+            pass
+        print("WARNING: No TTS engine found -- pip install pyttsx3")
 
     def speak(self, text):
-        if self.engine:
-            def _speak():
-                self.engine.say(text)
-                self.engine.runAndWait()
-            threading.Thread(target=_speak, daemon=True).start()
-        else:
-            print(f"[TTS]: {text}")
+        def _run():
+            try:
+                if self._kind == 'pyttsx3':
+                    self._engine.say(text); self._engine.runAndWait()
+                elif self._kind == 'gtts':
+                    from gtts import gTTS; import pygame, io
+                    fp = io.BytesIO(); gTTS(text=text, lang='en').write_to_fp(fp); fp.seek(0)
+                    pygame.mixer.music.load(fp, 'mp3'); pygame.mixer.music.play()
+                    while pygame.mixer.music.get_busy(): pass
+                elif self._kind == 'espeak':
+                    import subprocess; subprocess.run(['espeak', text], capture_output=True)
+                else:
+                    print(f"[TTS] {text}")
+            except Exception as exc:
+                print(f"TTS error: {exc}")
+        threading.Thread(target=_run, daemon=True).start()
 
 
 # ============================================================
-# SPEECH RECOGNIZER
+# SPEECH RECOGNISER
 # ============================================================
 
 class SpeechRecognizer:
     def __init__(self):
-        self.recognizer = None
-        self.microphone = None
-        if SPEECH_AVAILABLE:
-            try:
-                self.recognizer = sr.Recognizer()
-                self.microphone = sr.Microphone()
-                with self.microphone as source:
-                    self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            except:
-                self.recognizer = None
+        self.recognizer = self.microphone = None
+        if not SPEECH_AVAILABLE:
+            return
+        try:
+            self.recognizer = sr.Recognizer()
+            self.microphone = sr.Microphone()
+            with self.microphone as src:
+                self.recognizer.adjust_for_ambient_noise(src, duration=0.5)
+        except Exception:
+            self.recognizer = None
 
     def listen(self, timeout=5):
         if not self.recognizer:
             return None, "Microphone not available"
         try:
-            with self.microphone as source:
-                audio = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=5)
-            text = self.recognizer.recognize_google(audio)
-            return text.lower(), None
+            with self.microphone as src:
+                audio = self.recognizer.listen(src, timeout=timeout, phrase_time_limit=5)
+            return self.recognizer.recognize_google(audio).lower(), None
         except sr.WaitTimeoutError:
             return None, "No speech detected"
         except sr.UnknownValueError:
@@ -269,125 +174,261 @@ class SpeechRecognizer:
 
 
 # ============================================================
-# SIGN DATABASE
+# MODEL ARCHITECTURES  (V1 / V2 / V3)
+# ============================================================
+
+if TORCH_AVAILABLE:
+
+    class PositionalEncoding(nn.Module):
+        def __init__(self, d_model, max_len=100, dropout=0.1):
+            super().__init__()
+            self.dropout = nn.Dropout(p=dropout)
+            pe  = torch.zeros(max_len, d_model)
+            pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+            div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+            pe[:, 0::2] = torch.sin(pos * div)
+            pe[:, 1::2] = torch.cos(pos * div)
+            self.register_buffer('pe', pe.unsqueeze(0))
+        def forward(self, x):
+            return self.dropout(x + self.pe[:, :x.size(1)])
+
+    class ConvSubsampling(nn.Module):
+        def __init__(self, d_model, dropout=0.1):
+            super().__init__()
+            self.conv = nn.Sequential(
+                nn.Conv1d(d_model, d_model, 3, padding=1), nn.GELU(), nn.Dropout(dropout),
+                nn.Conv1d(d_model, d_model, 3, padding=1), nn.GELU(), nn.Dropout(dropout),
+            )
+            self.norm = nn.LayerNorm(d_model)
+        def forward(self, x):
+            r = x
+            return self.norm(self.conv(x.transpose(1,2)).transpose(1,2) + r)
+
+    # V3
+    class ASLModelV3(nn.Module):
+        def __init__(self, input_size, num_classes, d_model=384, n_heads=8,
+                     n_layers=6, dim_ff=1536, dropout=0.4, max_frames=64):
+            super().__init__()
+            self.input_norm  = nn.LayerNorm(input_size)
+            self.input_proj1 = nn.Linear(input_size, d_model)
+            self.input_proj2 = nn.Sequential(nn.GELU(), nn.Dropout(dropout*.5), nn.Linear(d_model, d_model))
+            self.input_ln    = nn.LayerNorm(d_model)
+            self.conv_sub    = ConvSubsampling(d_model, dropout*.5)
+            self.pos_enc     = PositionalEncoding(d_model, max_len=max_frames, dropout=dropout*.5)
+            self.transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d_model, n_heads, dim_ff, dropout,
+                                           activation='gelu', batch_first=True, norm_first=True),
+                num_layers=n_layers)
+            self.trans_ln    = nn.LayerNorm(d_model)
+            self.lstm        = nn.LSTM(d_model, d_model//2, 2, batch_first=True, dropout=dropout, bidirectional=True)
+            self.lstm_ln     = nn.LayerNorm(d_model)
+            self.n_q         = 4
+            self.pool_q      = nn.Parameter(torch.randn(1, self.n_q, d_model*2))
+            self.pool_attn   = nn.MultiheadAttention(d_model*2, n_heads, dropout=dropout, batch_first=True)
+            self.pool_ln     = nn.LayerNorm(d_model*2)
+            self.classifier  = nn.Sequential(
+                nn.Linear(d_model*2*self.n_q, 768), nn.LayerNorm(768), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(768, 384), nn.LayerNorm(384), nn.GELU(), nn.Dropout(dropout*.7),
+                nn.Linear(384, num_classes))
+
+        def forward(self, x):
+            B = x.size(0)
+            xn = self.input_norm(x)
+            x  = self.input_ln(self.input_proj2(self.input_proj1(xn)) + self.input_proj1(xn))
+            x  = self.conv_sub(x)
+            xt = self.trans_ln(self.transformer(self.pos_enc(x)))
+            xl, _ = self.lstm(x); xl = self.lstm_ln(xl)
+            comb  = torch.cat([xt, xl], -1)
+            p, _  = self.pool_attn(self.pool_q.expand(B,-1,-1), comb, comb)
+            return self.classifier(self.pool_ln(p).view(B, -1))
+
+    # V2
+    class ASLHybridModel(nn.Module):
+        def __init__(self, input_size, num_classes, d_model=256, dropout=0.3):
+            super().__init__()
+            self.proj = nn.Sequential(nn.Linear(input_size, d_model), nn.LayerNorm(d_model),
+                                      nn.GELU(), nn.Dropout(dropout))
+            self.pos  = PositionalEncoding(d_model)
+            self.tr   = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d_model, 8, 512, dropout, activation='gelu', batch_first=True),
+                num_layers=3)
+            self.lstm = nn.LSTM(d_model, d_model//2, 2, batch_first=True, dropout=dropout, bidirectional=True)
+            self.attn = nn.Sequential(nn.Linear(d_model*2, d_model), nn.Tanh(), nn.Linear(d_model, 1))
+            self.cls  = nn.Sequential(
+                nn.Linear(d_model*2, 512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(0.4),
+                nn.Linear(512, 256),       nn.LayerNorm(256), nn.GELU(), nn.Dropout(0.3),
+                nn.Linear(256, num_classes))
+        def forward(self, x):
+            x = self.proj(x); xt = self.tr(self.pos(x)); xl, _ = self.lstm(x)
+            comb = torch.cat([xt, xl], -1)
+            return self.cls((comb * torch.softmax(self.attn(comb), 1)).sum(1))
+
+    # V1
+    class ASLSignsModel(nn.Module):
+        def __init__(self, input_size, num_classes, hidden=256, layers=2):
+            super().__init__()
+            self.proj = nn.Sequential(nn.Linear(input_size, hidden), nn.LayerNorm(hidden),
+                                      nn.ReLU(), nn.Dropout(0.2))
+            self.lstm = nn.LSTM(hidden, hidden, layers, batch_first=True, dropout=0.3, bidirectional=True)
+            self.attn = nn.Sequential(nn.Linear(hidden*2, hidden), nn.Tanh(), nn.Linear(hidden, 1))
+            self.cls  = nn.Sequential(
+                nn.Linear(hidden*2, 512), nn.LayerNorm(512), nn.ReLU(), nn.Dropout(0.4),
+                nn.Linear(512, 256),      nn.LayerNorm(256), nn.ReLU(), nn.Dropout(0.3),
+                nn.Linear(256, num_classes))
+        def forward(self, x):
+            x = self.proj(x); out, _ = self.lstm(x)
+            return self.cls((out * torch.softmax(self.attn(out), 1)).sum(1))
+
+    def load_model(device):
+        print(f"Loading {MODEL_PATH} ...")
+        ck   = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+        inp  = ck['input_size']
+        ncls = ck['num_classes']
+        mf   = ck.get('max_frames', 64)
+        ver  = ck.get('version', 'v1')
+        keys = str(ck['model_state_dict'].keys())
+
+        if ver == 'v3' or ck.get('d_model') == 384 or 'pool_q' in keys or 'pool_queries' in keys:
+            print(f"Architecture: V3  ({ncls} classes, {mf} frames)")
+            mdl = ASLModelV3(inp, ncls, d_model=ck.get('d_model', 384),
+                             n_layers=ck.get('n_layers', 6), max_frames=mf).to(device)
+        elif 'transformer' in keys:
+            print(f"Architecture: V2  ({ncls} classes)")
+            mdl = ASLHybridModel(inp, ncls).to(device)
+        else:
+            print(f"Architecture: V1  ({ncls} classes)")
+            mdl = ASLSignsModel(inp, ncls).to(device)
+
+        mdl.load_state_dict(ck['model_state_dict'])
+        mdl.eval()
+        with open(ENCODER_PATH, 'rb') as f:
+            enc = pickle.load(f)
+        acc = ck.get('accuracy', 0)
+        if acc:
+            print(f"Trained accuracy: {acc*100:.1f}%")
+        return mdl, enc, mf
+
+
+# ============================================================
+# SIGN DATABASE  (for Voice -> Sign avatar)
 # ============================================================
 
 class SignDatabase:
     def __init__(self, cache_file):
-        self.signs = {}
-        self.classes = []
-        self.load_data(cache_file)
-
-    def interpolate_frames(self, frames, factor=3):
-        if len(frames) < 2:
-            return frames
-        interpolated = []
-        for i in range(len(frames) - 1):
-            interpolated.append(frames[i])
-            for j in range(1, factor):
-                t = j / factor
-                interpolated.append(frames[i] * (1 - t) + frames[i + 1] * t)
-        interpolated.append(frames[-1])
-        return np.array(interpolated)
-
-    def load_data(self, cache_file):
+        self.signs, self.classes = {}, []
         if not os.path.exists(cache_file):
             return
         cache = np.load(cache_file, allow_pickle=True)
-        X, y = cache['X'], cache['y']
-        self.classes = sorted(list(set(y)))
+        X, y  = cache['X'], cache['y']
+        self.classes = sorted(set(y))
         for i, label in enumerate(y):
             if label not in self.signs:
-                seq = X[i]
+                seq   = X[i]
                 valid = [seq[f] for f in range(len(seq)) if np.abs(seq[f]).sum() > 0.1]
                 if valid:
-                    self.signs[label] = self.interpolate_frames(np.array(valid), factor=3)
+                    self.signs[label] = self._interp(np.array(valid))
+
+    def _interp(self, frames, factor=3):
+        if len(frames) < 2: return frames
+        out = []
+        for i in range(len(frames)-1):
+            out.append(frames[i])
+            for j in range(1, factor):
+                t = j/factor
+                out.append(frames[i]*(1-t) + frames[i+1]*t)
+        out.append(frames[-1])
+        return np.array(out)
 
     def get_sign(self, word):
         return self.signs.get(word.lower().strip())
 
     def find_similar(self, word):
-        word = word.lower().strip()
-        if word in self.signs:
-            return [word]
-        return [s for s in self.classes if word in s or s in word][:3]
+        w = word.lower().strip()
+        if w in self.signs: return [w]
+        return [s for s in self.classes if w in s or s in w][:3]
 
 
 # ============================================================
-# AVATAR DRAWING
+# DRAWING HELPERS
 # ============================================================
 
-def draw_body(img, pose, cx, cy, scale):
-    body_color = (120, 130, 150)
-    shirt_color = (180, 100, 80)
-    shoulder_y = cy - int(scale * 0.1)
-    shoulder_w = int(scale * 0.25)
-    pts = np.array([
-        [cx - shoulder_w, shoulder_y],
-        [cx + shoulder_w, shoulder_y],
-        [cx + shoulder_w + 20, cy + int(scale * 0.3)],
-        [cx - shoulder_w - 20, cy + int(scale * 0.3)]
-    ], np.int32)
-    cv2.fillPoly(img, [pts], shirt_color)
-    cv2.rectangle(img, (cx - 15, shoulder_y - 30), (cx + 15, shoulder_y), body_color, -1)
-    l_wrist = pose[15]
-    r_wrist = pose[16]
-    lw = (int(cx + (l_wrist[0] - 0.5) * scale * 1.5), int(cy + (l_wrist[1] - 0.5) * scale))
-    rw = (int(cx + (r_wrist[0] - 0.5) * scale * 1.5), int(cy + (r_wrist[1] - 0.5) * scale))
-    cv2.line(img, (cx - shoulder_w, shoulder_y), lw, body_color, 18)
-    cv2.circle(img, lw, 20, body_color, -1)
-    cv2.line(img, (cx + shoulder_w, shoulder_y), rw, body_color, 18)
-    cv2.circle(img, rw, 20, body_color, -1)
+def draw_rect(img, x, y, w, h, color, radius=6):
+    cv2.rectangle(img, (x+radius, y),       (x+w-radius, y+h),       color, -1)
+    cv2.rectangle(img, (x,        y+radius), (x+w,        y+h-radius), color, -1)
+    for cx, cy in [(x+radius,y+radius),(x+w-radius,y+radius),
+                   (x+radius,y+h-radius),(x+w-radius,y+h-radius)]:
+        cv2.circle(img, (cx, cy), radius, color, -1)
+
+def put(img, text, x, y, scale=0.52, color=TEXT_COLOR, thick=1, center=False):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, _), _ = cv2.getTextSize(text, font, scale, thick)
+    tx = x - tw//2 if center else x
+    cv2.putText(img, text, (tx, y), font, scale, color, thick, cv2.LINE_AA)
+    return tw
+
+def draw_button(img, label, x, y, w, h, color, active=False):
+    draw_rect(img, x, y, w, h, color)
+    if active:
+        cv2.rectangle(img, (x,y), (x+w,y+h), HIGHLIGHT, 2)
+    put(img, label, x+w//2, y+h//2+6, scale=0.50, color=DARK_COLOR, center=True)
+
+def draw_bar(img, x, y, w, h, ratio, fg, bg=(50,50,50)):
+    draw_rect(img, x, y, w, h, bg, radius=3)
+    if ratio > 0:
+        draw_rect(img, x, y, max(6, int(w*ratio)), h, fg, radius=3)
 
 
-def draw_hand(img, hand, cx, cy, scale):
-    body_color = (120, 130, 150)
-    finger_chains = [
-        [0,1,2,3,4],[0,5,6,7,8],[0,9,10,11,12],[0,13,14,15,16],[0,17,18,19,20]
-    ]
-    points = [(int(cx + (hand[i][0] - 0.5)*scale*1.5), int(cy + (hand[i][1] - 0.5)*scale)) for i in range(21)]
-    for finger in finger_chains:
-        for i in range(len(finger) - 1):
-            cv2.line(img, points[finger[i]], points[finger[i+1]], body_color, max(4, 12 - i*2))
-        for f in finger:
-            cv2.circle(img, points[f], 6, body_color, -1)
+# ============================================================
+# AVATAR RENDERING
+# ============================================================
 
-
-def draw_head(img, cx, cy, radius):
-    body_color = (120, 130, 150)
-    hair_color = (40, 30, 25)
-    cv2.circle(img, (cx, cy), radius, body_color, -1)
-    cv2.ellipse(img, (cx, cy - radius//4), (radius, radius//2), 0, 180, 360, hair_color, -1)
-    eye_y = cy - radius // 6
-    for ex in [cx - radius//3, cx + radius//3]:
-        cv2.circle(img, (ex, eye_y), 8, (255, 255, 255), -1)
-        cv2.circle(img, (ex, eye_y), 4, (40, 30, 20), -1)
-    cv2.ellipse(img, (cx, cy + radius//3), (10, 5), 0, 0, 180, (100, 80, 80), 2)
-
-
-def render_avatar(landmarks, w, h):
-    img = np.full((h, w, 3), 30, dtype=np.uint8)
-    cx, cy = w // 2, h // 2 + 30
-    scale = min(w, h) * 0.5
-    left_hand  = landmarks[0:63].reshape(21, 3)
-    right_hand = landmarks[63:126].reshape(21, 3)
-    pose       = landmarks[126:225].reshape(33, 3)
-    draw_body(img, pose, cx, cy, scale)
-    if np.abs(right_hand).sum() > 0.5:
-        draw_hand(img, right_hand, cx, cy, scale)
-    if np.abs(left_hand).sum() > 0.5:
-        draw_hand(img, left_hand, cx, cy, scale)
-    draw_head(img, cx, cy - int(scale * 0.4), int(scale * 0.15))
-    return img
-
-
-def create_neutral_pose():
+def _neutral():
     lm = np.zeros(225, dtype=np.float32)
     ps = 126
-    for idx, x, y in [(11, 0.7, 0.4), (12, 0.3, 0.4), (13, 0.8, 0.6),
-                       (14, 0.2, 0.6), (15, 0.85, 0.8), (16, 0.15, 0.8)]:
-        lm[ps + idx*3], lm[ps + idx*3 + 1] = x, y
+    for idx, x, y in [(11,.7,.4),(12,.3,.4),(13,.8,.6),(14,.2,.6),(15,.85,.8),(16,.15,.8)]:
+        lm[ps+idx*3]=x; lm[ps+idx*3+1]=y
     return lm
+
+def render_avatar(landmarks, w, h):
+    img  = np.full((h, w, 3), 28, dtype=np.uint8)
+    cx   = w//2; cy = h//2+30; scale = min(w,h)*0.5
+    lh   = landmarks[0:63].reshape(21,3)
+    rh   = landmarks[63:126].reshape(21,3)
+    pose = landmarks[126:225].reshape(33,3)
+    skin = (120,130,150); shirt = (180,100,80)
+
+    # body
+    sw  = int(scale*.25); shy = cy - int(scale*.1)
+    pts = np.array([[cx-sw,shy],[cx+sw,shy],
+                    [cx+sw+20,cy+int(scale*.3)],[cx-sw-20,cy+int(scale*.3)]], np.int32)
+    cv2.fillPoly(img, [pts], shirt)
+    cv2.rectangle(img, (cx-15,shy-30), (cx+15,shy), skin, -1)
+    for i, side in [(15, -1),(16, 1)]:
+        p  = pose[i]
+        wp = (int(cx+(p[0]-.5)*scale*1.5*side*(-1)), int(cy+(p[1]-.5)*scale))
+        ox = -sw if i==15 else sw
+        cv2.line(img, (cx+ox, shy), wp, skin, 18)
+        cv2.circle(img, wp, 20, skin, -1)
+
+    # hands
+    chains = [[0,1,2,3,4],[0,5,6,7,8],[0,9,10,11,12],[0,13,14,15,16],[0,17,18,19,20]]
+    for hand in (lh, rh):
+        if np.abs(hand).sum() < 0.5: continue
+        pts2 = [(int(cx+(hand[i][0]-.5)*scale*1.5), int(cy+(hand[i][1]-.5)*scale)) for i in range(21)]
+        for ch in chains:
+            for a, b in zip(ch, ch[1:]):
+                cv2.line(img, pts2[a], pts2[b], skin, max(4, 12-ch.index(b)*2))
+            for f in ch: cv2.circle(img, pts2[f], 5, skin, -1)
+
+    # head
+    hcy = cy - int(scale*.4); hr = int(scale*.15)
+    cv2.circle(img, (cx,hcy), hr, skin, -1)
+    cv2.ellipse(img, (cx,hcy-hr//4), (hr,hr//2), 0, 180, 360, (40,30,25), -1)
+    for ex in [cx-hr//3, cx+hr//3]:
+        cv2.circle(img, (ex, hcy-hr//6), 8, (255,255,255), -1)
+        cv2.circle(img, (ex, hcy-hr//6), 4, (40,30,20),    -1)
+    cv2.ellipse(img, (cx, hcy+hr//3), (10,5), 0, 0, 180, (100,80,80), 2)
+    return img
 
 
 # ============================================================
@@ -395,461 +436,418 @@ def create_neutral_pose():
 # ============================================================
 
 class SignLanguageApp:
+
     def __init__(self):
-        self.tts   = TextToSpeech()
-        self.speech = SpeechRecognizer()
+        self.tts     = TextToSpeech()
+        self.speech  = SpeechRecognizer()
         self.sign_db = SignDatabase(CACHE_FILE)
+        self.device  = (torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                        if TORCH_AVAILABLE else None)
 
-        # Model
-        self.model = None
+        # model
+        self.model         = None
         self.label_encoder = None
-        self.max_frames = 64
-        self.device = (torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                       if TORCH_AVAILABLE else None)
+        self.max_frames    = 64
 
-        # MediaPipe
+        # mediapipe
+        self.holistic    = None
         self.mp_holistic = None
-        self.holistic = None
         if MEDIAPIPE_AVAILABLE:
             self.mp_holistic = mp.solutions.holistic
-            self.holistic = self.mp_holistic.Holistic(
+            self.holistic    = self.mp_holistic.Holistic(
                 min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-        # State
-        self.mode = "sign_to_voice"   # or "voice_to_sign"
-        self.is_running = False
-        self.cap = None
-        self.frame_buffer = deque(maxlen=64)
+        # state
+        self.mode         = "sign_to_voice"
+        self.is_running   = False
         self.status_msg   = "Ready"
         self.status_color = SUCCESS_COLOR
-        self.detected     = "---"
-        self.confidence   = ""
         self.history      = []
+
+        # Sign->Voice
+        self.recording     = False
+        self.voice_enabled = True
+        self.frame_buffer  = deque(maxlen=self.max_frames)
+        self.top3          = []
+        self.last_spoken   = ""
+        self._cam_frame    = None
+        self._lock         = threading.Lock()
+
+        # Voice->Sign
+        self.avatar_lm    = _neutral()
+        self.sign_queue   = deque()
+        self.current_sign = None
+        self.sign_frame_i = 0
+        self.is_signing   = False
         self.listening    = False
         self.text_input   = ""
         self.text_focused = False
 
-        # Avatar
-        self.avatar_lm      = create_neutral_pose()
-        self.sign_queue     = deque()
-        self.current_sign   = None
-        self.sign_frame_idx = 0
-        self.is_signing     = False
+        self._load_model()
 
-        # Latest camera frame
-        self._cam_frame = None
-        self._lock = threading.Lock()
+    # -- model ---------------------------------------------------------------
 
-        self.load_model()
-        self.set_status(f"Model: {self.status_msg}", self.status_color)
-
-        # Define button hit regions (x, y, w, h)
-        self.btn_sign_to_voice = (VIDEO_W + 10,  60, 210, 38)
-        self.btn_voice_to_sign = (VIDEO_W + 230, 60, 210, 38)
-        self.btn_start_stop    = (VIDEO_W + 50, 390, 150, 44)
-        self.btn_speak         = (VIDEO_W + 260, 390, 150, 44)
-        self.btn_submit_text   = (VIDEO_W + 360, 560, 80, 32)
-        self.text_box_region   = (VIDEO_W + 10, 540, 340, 34)
-
-    # ----------------------------------------------------------
-    # Model loading
-    # ----------------------------------------------------------
-
-    def load_model(self):
+    def _load_model(self):
         if not TORCH_AVAILABLE:
-            self.set_status("PyTorch not available", ERROR_COLOR); return
+            self._status("PyTorch not available", ERROR_COLOR); return
         if not os.path.exists(MODEL_PATH):
-            self.set_status(f"Model not found: {MODEL_PATH}", ERROR_COLOR); return
+            self._status(f"Model not found: {MODEL_PATH}", ERROR_COLOR); return
         try:
-            ck = torch.load(MODEL_PATH, map_location=self.device, weights_only=False)
-            self.max_frames = ck.get('max_frames', 64)
-            self.model = ASLModelV3(ck['input_size'], ck['num_classes'],
-                                    max_frames=self.max_frames).to(self.device)
-            self.model.load_state_dict(ck['model_state_dict'])
-            self.model.eval()
-            with open(ENCODER_PATH, 'rb') as f:
-                self.label_encoder = pickle.load(f)
-            self.set_status(f"Model loaded ({ck['num_classes']} signs)", SUCCESS_COLOR)
+            self.model, self.label_encoder, self.max_frames = load_model(self.device)
+            self.frame_buffer = deque(maxlen=self.max_frames)
+            self._status(f"Model ready  ({self.max_frames} frames)", SUCCESS_COLOR)
         except Exception as e:
-            self.set_status(f"Error: {str(e)[:40]}", ERROR_COLOR)
+            self._status(f"Load error: {str(e)[:40]}", ERROR_COLOR)
 
-    # ----------------------------------------------------------
-    # Helpers
-    # ----------------------------------------------------------
+    # -- helpers -------------------------------------------------------------
 
-    def set_status(self, msg, color=SUCCESS_COLOR):
-        self.status_msg   = msg
-        self.status_color = color
+    def _status(self, msg, color=SUCCESS_COLOR):
+        self.status_msg, self.status_color = msg, color
 
-    def add_history(self, text):
+    def _add_history(self, text):
         self.history.append(text)
-        if len(self.history) > 20:
-            self.history.pop(0)
+        if len(self.history) > 20: self.history.pop(0)
 
-    # ----------------------------------------------------------
-    # Camera thread
-    # ----------------------------------------------------------
+    # -- camera thread -------------------------------------------------------
 
     def _camera_thread(self):
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            self.set_status("Cannot open camera", ERROR_COLOR)
-            self.is_running = False
-            return
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            self._status("Cannot open camera", ERROR_COLOR)
+            self.is_running = False; return
         self.frame_buffer.clear()
         while self.is_running and self.mode == "sign_to_voice":
-            ret, frame = self.cap.read()
-            if not ret:
-                break
+            ret, frame = cap.read()
+            if not ret: break
             frame = cv2.flip(frame, 1)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             if self.holistic:
-                results = self.holistic.process(frame_rgb)
-                lm = self.extract_landmarks(results)
-                self.frame_buffer.append(lm)
-                frame = self.draw_landmarks(frame, results)
-                if len(self.frame_buffer) >= self.max_frames:
-                    self.predict_sign()
+                res = self.holistic.process(rgb)
+                lm  = self._extract(res)
+                if self.recording:
+                    self.frame_buffer.append(lm)
+                frame = self._draw_lm(frame, res)
+                if self.recording and len(self.frame_buffer) >= self.max_frames:
+                    self._predict()
                     self.frame_buffer.clear()
+                    self.recording = False
             with self._lock:
                 self._cam_frame = frame.copy()
             time.sleep(0.03)
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+        cap.release()
 
-    def extract_landmarks(self, results):
+    def _extract(self, results):
         lm = []
-        for attr, n in [('left_hand_landmarks', 63), ('right_hand_landmarks', 63),
-                        ('pose_landmarks', 99)]:
+        for attr, n in [('left_hand_landmarks',63),('right_hand_landmarks',63),('pose_landmarks',99)]:
             src = getattr(results, attr)
             if src:
-                for p in src.landmark:
-                    lm.extend([p.x, p.y, p.z])
+                for p in src.landmark: lm.extend([p.x, p.y, p.z])
             else:
-                lm.extend([0.0] * n)
+                lm.extend([0.0]*n)
         return np.array(lm, dtype=np.float32)
 
-    def draw_landmarks(self, frame, results):
-        if MEDIAPIPE_AVAILABLE:
-            mp_draw = mp.solutions.drawing_utils
-            for attr in ('left_hand_landmarks', 'right_hand_landmarks'):
-                src = getattr(results, attr)
-                if src:
-                    mp_draw.draw_landmarks(frame, src, self.mp_holistic.HAND_CONNECTIONS)
+    def _draw_lm(self, frame, results):
+        if not MEDIAPIPE_AVAILABLE: return frame
+        draw = mp.solutions.drawing_utils
+        for attr in ('left_hand_landmarks','right_hand_landmarks'):
+            src = getattr(results, attr)
+            if src: draw.draw_landmarks(frame, src, self.mp_holistic.HAND_CONNECTIONS)
         return frame
 
-    def predict_sign(self):
-        if not self.model or not TORCH_AVAILABLE:
-            return
-        seq = np.array(list(self.frame_buffer), dtype=np.float32)
-        seq = np.nan_to_num(seq, nan=0.0)
+    def _run_predict(self, seq):
+        seq = np.nan_to_num(seq)
         if len(seq) < self.max_frames:
-            pad = np.zeros((self.max_frames - len(seq), seq.shape[1]), dtype=np.float32)
-            seq = np.vstack([seq, pad])
+            seq = np.vstack([seq, np.zeros((self.max_frames-len(seq), seq.shape[1]), np.float32)])
         t = torch.FloatTensor(seq).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            out   = self.model(t)
-            probs = torch.softmax(out, dim=1)[0]
-            conf, idx = torch.max(probs, 0)
-            word = self.label_encoder.inverse_transform([idx.item()])[0]
-            confidence = conf.item()
-        if confidence > 0.4:
-            self.detected   = word.upper()
-            self.confidence = f"Confidence: {confidence*100:.1f}%"
-            self.add_history(f"[Sign→Voice] {word}")
-            self.tts.speak(word)
+            probs = torch.softmax(self.model(t), 1)[0]
+            top_p, top_i = torch.topk(probs, min(3, probs.shape[0]))
+            self.top3 = [(self.label_encoder.inverse_transform([i.item()])[0], p.item())
+                         for i, p in zip(top_i, top_p)]
 
-    # ----------------------------------------------------------
-    # Avatar animation
-    # ----------------------------------------------------------
+    def _predict(self):
+        if not self.model: return
+        self._run_predict(np.array(list(self.frame_buffer), dtype=np.float32))
+        if self.top3 and self.top3[0][1] > 0.4:
+            word = self.top3[0][0]
+            self._add_history(f"[Sign->Voice] {word}  {self.top3[0][1]*100:.0f}%")
+            if self.voice_enabled and word != self.last_spoken:
+                self.tts.speak(word); self.last_spoken = word
 
-    def step_avatar(self):
+    def _predict_now(self):
+        if not self.model or len(self.frame_buffer) < 5: return
+        self._run_predict(np.array(list(self.frame_buffer), dtype=np.float32))
+        if self.top3 and self.voice_enabled and self.top3[0][1] > 0.3:
+            self.tts.speak(self.top3[0][0]); self.last_spoken = self.top3[0][0]
+            self._add_history(f"[Sign->Voice] {self.top3[0][0]}  {self.top3[0][1]*100:.0f}%")
+
+    # -- avatar --------------------------------------------------------------
+
+    def _step_avatar(self):
         if self.is_signing and self.current_sign is not None:
-            if self.sign_frame_idx < len(self.current_sign):
-                target = self.current_sign[self.sign_frame_idx]
-                self.avatar_lm = 0.3 * target + 0.7 * self.avatar_lm
-                self.sign_frame_idx += 1
+            if self.sign_frame_i < len(self.current_sign):
+                tgt = self.current_sign[self.sign_frame_i]
+                self.avatar_lm  = .3*tgt + .7*self.avatar_lm
+                self.sign_frame_i += 1
             else:
-                self.is_signing = False
-                self.sign_frame_idx = 0
-                if self.sign_queue:
-                    self.play_next_sign()
-                else:
-                    self.detected = "---"
+                self.is_signing = False; self.sign_frame_i = 0
+                if self.sign_queue: self._play_next()
         else:
-            neutral = create_neutral_pose()
-            self.avatar_lm = 0.95 * self.avatar_lm + 0.05 * neutral
+            self.avatar_lm = .95*self.avatar_lm + .05*_neutral()
 
-    def play_next_sign(self):
+    def _play_next(self):
         if self.sign_queue:
             word = self.sign_queue.popleft()
-            self.current_sign   = self.sign_db.get_sign(word)
-            self.sign_frame_idx = 0
-            self.is_signing     = True
-            self.detected       = word.upper()
+            self.current_sign = self.sign_db.get_sign(word)
+            self.sign_frame_i = 0; self.is_signing = True
 
-    # ----------------------------------------------------------
-    # Speech thread
-    # ----------------------------------------------------------
-
-    def _listen_thread(self):
-        self.set_status("Listening...", ACCENT_COLOR)
-        text, error = self.speech.listen()
-        self.listening = False
-        if text:
-            self.process_text(text)
-        else:
-            self.set_status(error, ERROR_COLOR)
-
-    def process_text(self, text):
-        self.set_status(f"Heard: {text}", SUCCESS_COLOR)
-        self.add_history(f"[Voice→Sign] {text}")
+    def _process_text(self, text):
+        self._status(f"Heard: {text}", SUCCESS_COLOR)
+        self._add_history(f"[Voice->Sign] {text}")
         for word in text.lower().split():
             word = ''.join(c for c in word if c.isalpha())
-            if not word:
-                continue
-            if self.sign_db.get_sign(word) is not None:
+            if not word: continue
+            if self.sign_db.get_sign(word):
                 self.sign_queue.append(word)
             else:
-                similar = self.sign_db.find_similar(word)
-                if similar:
-                    self.sign_queue.append(similar[0])
+                sim = self.sign_db.find_similar(word)
+                if sim: self.sign_queue.append(sim[0])
         if self.sign_queue and not self.is_signing:
-            self.play_next_sign()
+            self._play_next()
 
-    # ----------------------------------------------------------
-    # UI rendering
-    # ----------------------------------------------------------
+    def _listen_thread(self):
+        self._status("Listening...", ACCENT_COLOR)
+        text, err = self.speech.listen()
+        self.listening = False
+        if text: self._process_text(text)
+        else:    self._status(err, ERROR_COLOR)
 
-    def render_panel(self, panel):
-        """Draw the right control panel onto a (WIN_H x PANEL_W) image."""
+    # -- mode / running ------------------------------------------------------
+
+    def _switch_mode(self, mode):
+        self.is_running = False; self._cam_frame = None
+        self.recording  = False; self.top3 = []
+        self.mode       = mode
+        self._status(f"Mode: {mode.replace('_',' ').title()}", SUCCESS_COLOR)
+
+    def _toggle_running(self):
+        if self.is_running:
+            self.is_running = False; self.recording = False
+            self._status("Stopped", DIM_COLOR)
+        else:
+            self.is_running = True
+            self._status("Running...", SUCCESS_COLOR)
+            if self.mode == "sign_to_voice":
+                threading.Thread(target=self._camera_thread, daemon=True).start()
+
+    # -- panel render --------------------------------------------------------
+
+    def _render_panel(self, panel):
         h, w = panel.shape[:2]
         panel[:] = np.array(PANEL_COLOR, dtype=np.uint8)
 
-        # ---- Title ----
-        draw_text(panel, "Sign Language", w//2, 28, scale=0.75,
-                  color=TEXT_COLOR, thickness=2, center=True)
-        draw_text(panel, "Translator", w//2, 52, scale=0.65,
-                  color=ACCENT_COLOR, thickness=1, center=True)
+        # title
+        put(panel, "Sign Language Translator", w//2, 30, .68, TEXT_COLOR, 2, center=True)
 
-        # ---- Mode buttons ----
-        bx1, bx2 = 10, 230
-        by = 70
-        bw, bh = 210, 38
-        draw_button(panel, "Sign -> Voice", bx1, by, bw, bh,
-                    ACCENT_COLOR if self.mode == "sign_to_voice" else (80,80,80),
-                    active=(self.mode == "sign_to_voice"))
-        draw_button(panel, "Voice -> Sign", bx2, by, bw, bh,
-                    ACCENT_COLOR if self.mode == "voice_to_sign" else (80,80,80),
-                    active=(self.mode == "voice_to_sign"))
+        # mode buttons
+        draw_button(panel, "Sign -> Voice", 8,   58, 215, 36,
+                    ACCENT_COLOR if self.mode=="sign_to_voice" else (72,72,72),
+                    active=(self.mode=="sign_to_voice"))
+        draw_button(panel, "Voice -> Sign", 230, 58, 215, 36,
+                    ACCENT_COLOR if self.mode=="voice_to_sign" else (72,72,72),
+                    active=(self.mode=="voice_to_sign"))
 
-        # ---- Separator ----
-        cv2.line(panel, (10, 120), (w-10, 120), (70,70,70), 1)
+        # start/stop  (top-right)
+        s_col = ERROR_COLOR if self.is_running else SUCCESS_COLOR
+        s_lbl = "[ STOP ]" if self.is_running else "[ START ]"
+        draw_button(panel, s_lbl, w-145, 102, 138, 36, s_col)
 
-        # ---- Status ----
-        draw_text(panel, "STATUS", 10, 145, scale=0.42, color=DIM_COLOR, thickness=1)
-        msg = self.status_msg[:48]
-        draw_text(panel, msg, 10, 165, scale=0.5, color=self.status_color)
+        cv2.line(panel, (8,105), (w-8,105), (70,70,70), 1)
 
-        # ---- Detected sign ----
-        cv2.line(panel, (10, 182), (w-10, 182), (70,70,70), 1)
-        draw_text(panel, "DETECTED SIGN", 10, 202, scale=0.42, color=DIM_COLOR)
-        det_scale = min(1.4, 14.0 / max(len(self.detected), 1))
-        draw_text(panel, self.detected, w//2, 255, scale=det_scale,
-                  color=HIGHLIGHT, thickness=2, center=True)
-        draw_text(panel, self.confidence, w//2, 280, scale=0.45,
-                  color=DIM_COLOR, center=True)
+        # status
+        put(panel, "STATUS", 8, 122, .38, DIM_COLOR)
+        put(panel, self.status_msg[:52], 8, 140, .46, self.status_color)
 
-        # ---- Start/Stop + Speak buttons ----
-        cv2.line(panel, (10, 300), (w-10, 300), (70,70,70), 1)
-        sx, sy, sw, sh = 50, 320, 150, 44
-        running_lbl = "[ STOP ]" if self.is_running else "[ START ]"
-        running_col = ERROR_COLOR if self.is_running else SUCCESS_COLOR
-        draw_button(panel, running_lbl, sx, sy, sw, sh, running_col)
+        cv2.line(panel, (8,155), (w-8,155), (70,70,70), 1)
 
-        if self.mode == "voice_to_sign":
-            lx, ly, lw2, lh = 260, 320, 150, 44
-            listen_col = ACCENT_COLOR if not self.listening else (200, 200, 50)
-            listen_lbl = "LISTENING..." if self.listening else "MIC SPEAK"
-            draw_button(panel, listen_lbl, lx, ly, lw2, lh, listen_col)
+        # ---- Sign->Voice pane ----
+        if self.mode == "sign_to_voice":
 
-        # ---- Text input (Voice→Sign mode) ----
-        if self.mode == "voice_to_sign":
-            cv2.line(panel, (10, 375), (w-10, 375), (70,70,70), 1)
-            draw_text(panel, "TYPE TEXT  (Enter to send):", 10, 395, scale=0.42, color=DIM_COLOR)
-            tbx, tby, tbw, tbh = 10, 408, 420, 34
-            box_color = (60, 70, 80) if self.text_focused else (50, 50, 50)
-            draw_rect(panel, tbx, tby, tbw, tbh, box_color, radius=5)
+            # REC indicator + VOL toggle
+            r_col = REC_COLOR if self.recording else (72,72,72)
+            draw_rect(panel, 8, 162, 115, 28, r_col, radius=5)
+            put(panel, "● REC" if self.recording else "○ READY", 66, 181, .5, TEXT_COLOR, center=True)
+
+            v_col = SUCCESS_COLOR if self.voice_enabled else (72,72,72)
+            draw_rect(panel, 132, 162, 105, 28, v_col, radius=5)
+            put(panel, "VOL ON" if self.voice_enabled else "VOL OFF", 184, 181, .5, DARK_COLOR, center=True)
+
+            # buffer progress
+            ratio = len(self.frame_buffer) / max(self.max_frames, 1)
+            put(panel, f"Buffer  {len(self.frame_buffer)}/{self.max_frames}", 8, 213, .4, DIM_COLOR)
+            draw_bar(panel, 8, 218, w-16, 13, ratio, SUCCESS_COLOR)
+
+            # top-3 predictions
+            put(panel, "TOP PREDICTIONS", 8, 252, .4, DIM_COLOR)
+            y0 = 258
+            for i, (word, conf) in enumerate(self.top3[:3]):
+                bar_y  = y0 + i*52
+                c_col  = SUCCESS_COLOR if conf>.5 else (ACCENT_COLOR if conf>.3 else DIM_COLOR)
+                sc     = .78 if i==0 else .54
+                th     = 2   if i==0 else 1
+                put(panel, f"{i+1}. {word.upper()}", 8, bar_y+20, sc, c_col, th)
+                put(panel, f"{conf*100:.1f}%", w-60, bar_y+20, .5, c_col)
+                draw_bar(panel, 8, bar_y+24, w-16, 10, conf, c_col)
+
+            # keyboard hint
+            put(panel, "S=start  R=record  C=clear  P=predict now", 8, h-42, .37, DIM_COLOR)
+            put(panel, "V=voice toggle  1/2=mode  Q=quit",           8, h-24, .37, DIM_COLOR)
+
+        # ---- Voice->Sign pane ----
+        else:
+            signing_word = ""
+            if self.is_signing and self.sign_queue or self.is_signing:
+                signing_word = "SIGNING..."
+            put(panel, "AVATAR",    8,    180, .4, DIM_COLOR)
+            put(panel, signing_word or "READY", w//2, 215, .85, HIGHLIGHT, 2, center=True)
+
+            # text input
+            cv2.line(panel, (8,235), (w-8,235), (70,70,70), 1)
+            put(panel, "TYPE TEXT  (Enter to send):", 8, 252, .4, DIM_COLOR)
+            tbx,tby,tbw,tbh = 8, 258, w-16, 34
+            draw_rect(panel, tbx, tby, tbw, tbh, (62,72,82) if self.text_focused else (50,50,50), radius=5)
             if self.text_focused:
-                cv2.rectangle(panel, (tbx, tby), (tbx+tbw, tby+tbh), ACCENT_COLOR, 1)
-            display_text = self.text_input[-38:] + ("|" if self.text_focused else "")
-            draw_text(panel, display_text, tbx+8, tby+23, scale=0.52, color=TEXT_COLOR)
+                cv2.rectangle(panel,(tbx,tby),(tbx+tbw,tby+tbh),ACCENT_COLOR,1)
+            put(panel, self.text_input[-44:]+( "|" if self.text_focused else ""), tbx+8, tby+23, .5, TEXT_COLOR)
 
-        # ---- History ----
-        hist_y = 460 if self.mode == "voice_to_sign" else 380
-        cv2.line(panel, (10, hist_y - 18), (w-10, hist_y - 18), (70,70,70), 1)
-        draw_text(panel, "HISTORY", 10, hist_y - 2, scale=0.42, color=DIM_COLOR)
-        for i, entry in enumerate(self.history[-10:][::-1]):
-            col = ACCENT_COLOR if "Sign" in entry else SUCCESS_COLOR
-            draw_text(panel, entry[:50], 10, hist_y + 18 + i*20, scale=0.42, color=col)
+            # mic button
+            m_col = (200,200,50) if self.listening else ACCENT_COLOR
+            m_lbl = "LISTENING..." if self.listening else "MIC SPEAK"
+            draw_button(panel, m_lbl, 8, 302, 210, 36, m_col)
 
-    def render_frame(self):
+            put(panel, "M=mic  click textbox to type  Q=quit", 8, h-24, .37, DIM_COLOR)
+
+        # history (shared)
+        hist_top = h - 170
+        cv2.line(panel, (8,hist_top-14), (w-8,hist_top-14), (70,70,70), 1)
+        put(panel, "HISTORY", 8, hist_top, .38, DIM_COLOR)
+        for i, entry in enumerate(self.history[-8:][::-1]):
+            col = ACCENT_COLOR if "Sign->" in entry else SUCCESS_COLOR
+            put(panel, entry[:54], 8, hist_top+16+i*19, .38, col)
+
+    # -- full frame ----------------------------------------------------------
+
+    def _render(self):
         canvas = np.full((WIN_H, WIN_W, 3), BG_COLOR, dtype=np.uint8)
 
-        # ---- Left: video or avatar ----
         if self.mode == "sign_to_voice":
             with self._lock:
-                frame = self._cam_frame.copy() if self._cam_frame is not None else None
-            if frame is not None:
-                resized = cv2.resize(frame, (VIDEO_W, WIN_H))
-                canvas[:, :VIDEO_W] = resized
+                cam = self._cam_frame.copy() if self._cam_frame is not None else None
+            if cam is not None:
+                canvas[:, :VIDEO_W] = cv2.resize(cam, (VIDEO_W, WIN_H))
             else:
-                draw_text(canvas, "Camera not started", VIDEO_W//2, WIN_H//2,
-                          scale=0.8, color=DIM_COLOR, center=True)
-                draw_text(canvas, "Press START", VIDEO_W//2, WIN_H//2 + 35,
-                          scale=0.6, color=DIM_COLOR, center=True)
+                put(canvas, "Camera not started", VIDEO_W//2, WIN_H//2-20, .9, DIM_COLOR, center=True)
+                put(canvas, "Press S to start, then R to record", VIDEO_W//2, WIN_H//2+22, .6, DIM_COLOR, center=True)
         else:
-            self.step_avatar()
-            avatar = render_avatar(self.avatar_lm, VIDEO_W, WIN_H)
-            canvas[:, :VIDEO_W] = avatar
+            self._step_avatar()
+            canvas[:, :VIDEO_W] = render_avatar(self.avatar_lm, VIDEO_W, WIN_H)
 
-        # Divider
-        cv2.line(canvas, (VIDEO_W, 0), (VIDEO_W, WIN_H), (70,70,70), 2)
-
-        # ---- Right: control panel ----
-        panel = canvas[:, VIDEO_W:]
-        self.render_panel(panel)
-
+        cv2.line(canvas, (VIDEO_W,0), (VIDEO_W,WIN_H), (70,70,70), 2)
+        self._render_panel(canvas[:, VIDEO_W:])
         return canvas
 
-    # ----------------------------------------------------------
-    # Mouse callback
-    # ----------------------------------------------------------
+    # -- mouse ---------------------------------------------------------------
 
-    def _in_btn(self, x, y, btn):
-        bx, by, bw, bh = btn
-        return bx <= x <= bx + bw and by <= y <= by + bh
+    def _in(self, px, py, x, y, w, h):
+        return x <= px <= x+w and y <= py <= y+h
 
     def on_mouse(self, event, x, y, flags, param):
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
-        # Translate panel coordinates
-        px = x - VIDEO_W   # x within panel
+        if event != cv2.EVENT_LBUTTONDOWN: return
+        px = x - VIDEO_W
 
-        # Mode buttons (panel-relative)
-        if self._in_btn(px, y, (10, 70, 210, 38)):
-            self.switch_mode("sign_to_voice")
-        elif self._in_btn(px, y, (230, 70, 210, 38)):
-            self.switch_mode("voice_to_sign")
-        # Start/stop
-        elif self._in_btn(px, y, (50, 320, 150, 44)):
-            self.toggle_running()
-        # Speak (voice_to_sign mode only)
-        elif self.mode == "voice_to_sign" and self._in_btn(px, y, (260, 320, 150, 44)):
-            if not self.listening:
+        if self._in(px, y,   8, 58, 215, 36): self._switch_mode("sign_to_voice"); return
+        if self._in(px, y, 230, 58, 215, 36): self._switch_mode("voice_to_sign"); return
+        if self._in(px, y, PANEL_W-145, 102, 138, 36): self._toggle_running(); return
+
+        if self.mode == "sign_to_voice":
+            if self._in(px, y, 8, 162, 115, 28) and self.is_running:
+                self.recording = not self.recording
+                if self.recording: self.frame_buffer.clear(); self.top3 = []
+            elif self._in(px, y, 132, 162, 105, 28):
+                self.voice_enabled = not self.voice_enabled
+        elif self.mode == "voice_to_sign":
+            if self._in(px, y, 8, 258, PANEL_W-16, 34):
+                self.text_focused = True
+            elif self._in(px, y, 8, 302, 210, 36) and not self.listening:
                 self.listening = True
                 threading.Thread(target=self._listen_thread, daemon=True).start()
-        # Text box
-        elif self.mode == "voice_to_sign" and self._in_btn(px, y, (10, 408, 420, 34)):
-            self.text_focused = True
-        else:
-            self.text_focused = False
+            else:
+                self.text_focused = False
 
-    # ----------------------------------------------------------
-    # Keyboard handling
-    # ----------------------------------------------------------
+    # -- keyboard ------------------------------------------------------------
 
     def on_key(self, key):
-        if key == -1:
-            return
-        key = key & 0xFF
+        if key == -1: return False
+        k = key & 0xFF
 
         if self.text_focused and self.mode == "voice_to_sign":
-            if key == 13:  # Enter
-                if self.text_input.strip():
-                    self.process_text(self.text_input.strip())
-                    self.text_input = ""
-            elif key == 8:  # Backspace
-                self.text_input = self.text_input[:-1]
-            elif 32 <= key <= 126:
-                self.text_input += chr(key)
-        else:
-            if key == ord('q'):
-                return True   # signal quit
-            elif key == ord('s'):
-                self.toggle_running()
-            elif key == ord('1'):
-                self.switch_mode("sign_to_voice")
-            elif key == ord('2'):
-                self.switch_mode("voice_to_sign")
-            elif key == ord('m') and self.mode == "voice_to_sign":
-                if not self.listening:
-                    self.listening = True
-                    threading.Thread(target=self._listen_thread, daemon=True).start()
+            if k == 13:
+                if self.text_input.strip(): self._process_text(self.text_input.strip()); self.text_input = ""
+            elif k == 8:  self.text_input = self.text_input[:-1]
+            elif 32 <= k <= 126: self.text_input += chr(k)
+            return False
+
+        if   k == ord('q'): return True
+        elif k == ord('s'): self._toggle_running()
+        elif k == ord('1'): self._switch_mode("sign_to_voice")
+        elif k == ord('2'): self._switch_mode("voice_to_sign")
+        elif self.mode == "sign_to_voice" and self.is_running:
+            if   k == ord('r'):
+                self.recording = not self.recording
+                if self.recording: self.frame_buffer.clear(); self.top3=[]; print("Recording...")
+                else: print("Paused")
+            elif k == ord('c'):
+                self.frame_buffer.clear(); self.recording=False; self.top3=[]; print("Cleared")
+            elif k == ord('p'): self._predict_now()
+            elif k == ord('v'):
+                self.voice_enabled = not self.voice_enabled
+                print(f"Voice: {'ON' if self.voice_enabled else 'OFF'}")
+        elif self.mode == "voice_to_sign":
+            if k == ord('m') and not self.listening:
+                self.listening = True
+                threading.Thread(target=self._listen_thread, daemon=True).start()
         return False
 
-    # ----------------------------------------------------------
-    # Mode switching / start/stop
-    # ----------------------------------------------------------
-
-    def switch_mode(self, mode):
-        self.is_running = False
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-        self._cam_frame = None
-        self.mode = mode
-        self.detected   = "---"
-        self.confidence = ""
-        self.set_status(f"Mode: {mode.replace('_', ' ').title()}", SUCCESS_COLOR)
-
-    def toggle_running(self):
-        if self.is_running:
-            self.is_running = False
-            self.set_status("Stopped", DIM_COLOR)
-        else:
-            self.is_running = True
-            self.set_status("Running...", SUCCESS_COLOR)
-            if self.mode == "sign_to_voice":
-                threading.Thread(target=self._camera_thread, daemon=True).start()
-            else:
-                # Avatar mode just ticks in render loop
-                pass
-
-    # ----------------------------------------------------------
-    # Main loop
-    # ----------------------------------------------------------
+    # -- main loop -----------------------------------------------------------
 
     def run(self):
         cv2.namedWindow("Sign Language Translator", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Sign Language Translator", WIN_W, WIN_H)
         cv2.setMouseCallback("Sign Language Translator", self.on_mouse)
 
-        print("Controls: Q=quit | S=start/stop | 1=Sign->Voice | 2=Voice->Sign | M=mic")
+        print("\n" + "="*54)
+        print("  Sign Language Translator  |  OpenCV UI")
+        print("="*54)
+        print("  1 / 2     switch mode  (Sign->Voice / Voice->Sign)")
+        print("  S         start / stop camera")
+        print("  R         toggle recording        [Sign->Voice]")
+        print("  C         clear frame buffer      [Sign->Voice]")
+        print("  P         force-predict now       [Sign->Voice]")
+        print("  V         toggle TTS voice        [Sign->Voice]")
+        print("  M         activate microphone     [Voice->Sign]")
+        print("  Q         quit")
+        print("="*54 + "\n")
 
         while True:
-            frame = self.render_frame()
-            cv2.imshow("Sign Language Translator", frame)
-
-            key = cv2.waitKey(33)
-            quit_requested = self.on_key(key)
-            if quit_requested:
+            cv2.imshow("Sign Language Translator", self._render())
+            if self.on_key(cv2.waitKey(33)):
                 break
 
-        # Cleanup
         self.is_running = False
-        if self.cap:
-            self.cap.release()
-        if self.holistic:
-            self.holistic.close()
+        if self.holistic: self.holistic.close()
         cv2.destroyAllWindows()
 
 
 # ============================================================
-# ENTRY POINT
-# ============================================================
-
 if __name__ == "__main__":
-    app = SignLanguageApp()
-    app.run()
+    SignLanguageApp().run()
