@@ -31,10 +31,10 @@ import torch.nn as nn
 # ============================================================
 # CONFIG — Update these paths to match your setup
 # ============================================================
-MODEL_PATH = "asl_signs_model_v3.pth"          # Your trained V3 checkpoint
-ENCODER_PATH = "asl_signs_encoder_v3.pkl"       # Your label encoder
-ONNX_OUTPUT_PATH = "asl_model_v3.onnx"          # Output ONNX file
-ONNX_OPTIMIZED_PATH = "asl_model_v3_opt.onnx"   # Optimized ONNX (optional)
+MODEL_PATH = "data/asl_signs_model_v3.pth"          # Your trained V3 checkpoint
+ENCODER_PATH = "data/asl_signs_encoder_v3.pkl"       # Your label encoder
+ONNX_OUTPUT_PATH = "data/asl_model_v3.onnx"          # Output ONNX file
+ONNX_OPTIMIZED_PATH = "data/asl_model_v3_opt.onnx"   # Optimized ONNX (optional)
 
 # Model architecture params (must match training)
 INPUT_SIZE = 225        # 75 landmarks × 3 coordinates (x, y, z)
