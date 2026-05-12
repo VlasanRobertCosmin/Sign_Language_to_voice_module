@@ -40,7 +40,7 @@ except Exception as e:
 # CONFIGURATION
 # ============================================================
 
-CACHE_FILE = "asl_signs_cache.npz"
+CACHE_FILE = "data/asl_signs_cache.npz"
 
 WINDOW_WIDTH = 1000
 WINDOW_HEIGHT = 700
