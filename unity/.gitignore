@@ -1,11 +1,11 @@
 # Unity generated folders
-UnityProject/Library/
-UnityProject/Temp/
-UnityProject/Obj/
-UnityProject/Build/
-UnityProject/Builds/
-UnityProject/Logs/
-UnityProject/UserSettings/
+Library/
+Temp/
+Obj/
+Build/
+Builds/
+Logs/
+UserSettings/
 
 # OS files
 .DS_Store
