@@ -96,12 +96,12 @@ def speak(text):
 # ============================================================
 
 # Choose your model version:
-MODEL_PATH = "asl_signs_model_v3.pth"      # V3 model
-ENCODER_PATH = "asl_signs_encoder_v3.pkl"  # V3 encoder
+MODEL_PATH = "data/asl_signs_model_v3.pth"      # V3 model
+ENCODER_PATH = "data/asl_signs_encoder_v3.pkl"  # V3 encoder
 
 # Or use older versions:
-# MODEL_PATH = "asl_signs_model_v2.pth"
-# ENCODER_PATH = "asl_signs_encoder_v2.pkl"
+# MODEL_PATH = "data/asl_signs_model_v2.pth"
+# ENCODER_PATH = "data/asl_signs_encoder_v2.pkl"
 
 # MODEL_PATH = "asl_signs_model.pth"
 # ENCODER_PATH = "asl_signs_encoder.pkl"

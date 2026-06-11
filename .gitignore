@@ -1,0 +1,9 @@
+.DS_Store
+
+# Unity generated / IDE files
+unity/ASL_VR_App/.vscode/
+unity/ASL_VR_App/*.csproj
+unity/ASL_VR_App/*.sln
+unity/ASL_VR_App/*.user
+unity/ASL_VR_App/*.userprefs
+unity/ASL_VR_App/Assets/TextMesh Pro/Examples & Extras/
